@@ -1,0 +1,423 @@
+import numpy as np
+import pickle
+import time
+import os
+import scipy
+from scipy import interpolate
+import matplotlib
+import matplotlib.pyplot as plt
+from matplotlib import colors as plt_colors
+
+# ==================== 依賴函式 ====================
+def create_folder(path):
+    path = os.fspath(path)
+    if os.path.splitext(os.path.basename(path))[1]:
+        folder = os.path.dirname(path)
+    else:
+        folder = path
+    if folder in ['', '.']: return
+    if folder and not os.path.exists(folder):
+        os.makedirs(folder)
+
+def save_pkl(file_path, data):
+    if not isinstance(file_path, str): file_path, data = data, file_path
+    if not file_path.lower().endswith('.pkl'): file_path = file_path + '.pkl'
+    create_folder(file_path)
+    with open(file_path, 'wb') as f: pickle.dump(data, f)
+
+def load_pkl(file_path):
+    file_path = file_path.replace('.pkl', '')
+    with open(file_path + '.pkl', 'rb') as f: data = pickle.load(f)
+    return data
+
+
+# ==================== Poly_Fitting（整份複製） ====================
+class Poly_Fitting():
+    def __init__(self, print_detial=False):
+        self.w = None
+        self.print_detial = print_detial
+        self.scaler = {}
+        self.info = {}
+    def upsample(self, x, y, ratio=2):
+        xnew = np.linspace(x.min(), x.max(), int(len(x)*ratio))
+        f = scipy.interpolate.interp1d(x, y)
+        ynew = f(xnew)
+        return xnew, ynew
+    def _scale_fit(self, data, name, eps=1e-4):
+        dmin = data.min(axis=0); dmax = data.max(axis=0)
+        self.scaler[name] = {'min':dmin, 'max':dmax, 'eps':eps}
+        return (data - dmin) / (dmax - dmin + eps)
+    def _scale_apply(self, data, name):
+        p = self.scaler[name]
+        return (data - p['min']) / (p['max'] - p['min'] + p['eps'])
+    def _scale_backward(self, data, name):
+        p = self.scaler[name]
+        return data * (p['max'] - p['min'] + p['eps']) + p['min']
+    def _apply_drop_outlier(self, x, y, yfit, rate):
+        e = abs(yfit - y)
+        rank = np.argsort(e)
+        num_samples = x.shape[0]
+        preserve_samples = int(round(num_samples * (1-rate), 0))
+        rank = rank[:preserve_samples]
+        x = x[rank]; y = y[rank]; yfit = yfit[rank]
+        return x, y, yfit
+    def _least_square(self, x, y):
+        A = self.convert2basis(x, order=self.order)
+        if A is None: return None
+        self.info['num_variables'] = A.shape[1]; self.info['num_samples'] = A.shape[0]
+        if self.print_detial:
+            print('Least Square samples:{}, variables:{}, ratio:{}'.format(
+                self.info['num_samples'], self.info['num_variables'],
+                round(self.info['num_samples']/self.info['num_variables'], 2)))
+        self.w = np.linalg.lstsq(A, y, rcond=None)[0]
+    def least_square(self, x, y, order=None, normalize=True, epoch=1, dropout=0.05):
+        x = np.array(x); y = np.array(y)
+        self.normalize = normalize
+        self.order = order
+        if self.normalize:
+            y = self._scale_fit(y, name='y', eps=1e-4)
+            x = self._scale_fit(x, name='x', eps=1e-4)
+        self.x, self.y = x, y
+        for tx in range(epoch):
+            if tx != 0:
+                yfit = self.forward(x, normalize=False)
+            else:
+                yfit = y.copy()
+            x, y, yfit = self._apply_drop_outlier(x, y, yfit, rate=dropout)
+            self._least_square(x, y)
+    def forward(self, x, normalize=None):
+        if normalize is None: normalize = self.normalize
+        if normalize:
+            x = self._scale_apply(x, name='x')
+        A = self.convert2basis(x, self.order)
+        y = 0
+        for j in range(len(self.w)):
+            y += self.w[j] * A[:, j]
+        if normalize:
+            y = self._scale_backward(y, name='y')
+        return y
+    def convert2basis(self, x, order=None):
+        if order is None:
+            print('Error! Wihout giving basis parameters')
+            return None
+        if x.ndim == 2:
+            mode = 'multiple'; shape2 = x.shape[1]
+        else:
+            mode = 'single'
+        A = []
+        for ix in order:
+            if mode == 'multiple':
+                tmp = 1
+                for vari in range(shape2):
+                    tmp *= x[:, vari]**ix[vari]
+            elif mode == 'single':
+                tmp = x ** ix
+            A += [tmp]
+        A = np.vstack(A).T
+        return A
+    def print_equation(self, digits=3):
+        nvar = len(self.order[0]) if isinstance(self.order[0], (list, tuple)) else 1
+        terms = []
+        for j in range(len(self.w)):
+            ix = self.order[j] if isinstance(self.order[j], (list, tuple)) else [self.order[j]]
+            coef = round(float(self.w[j]), digits)
+            mono = []
+            for k in range(len(ix)):
+                e = ix[k]
+                if e == 0: continue
+                vname = 'x' if nvar == 1 else 'x{}'.format(k+1)
+                mono.append(vname if e == 1 else '({}^{})'.format(vname, e))
+            terms.append('{}*{}'.format(coef, '*'.join(mono)) if mono else '{}'.format(coef))
+        eq = ('y = ' + ' + '.join(terms)).replace('+ -', '- ')
+        if self.print_detial: print(eq)
+        return eq
+    def save(self, path='./pfit_weights.pkl'):
+        data = {'w':self.w, 'order':self.order, 'normalize':self.normalize, 'scaler':self.scaler}
+        save_pkl(path, data)
+        return self
+    def load(self, path='./pfit_weights.pkl'):
+        data = load_pkl(path)
+        self.w = data['w']; self.order = data['order']
+        self.normalize = data['normalize']; self.scaler = data['scaler']
+        return self
+    def plot_linearity(self, x, y, xlabel='x', ylabel='y', save_name=None):
+        nvar = len(self.order[0]) if isinstance(self.order[0], (list, tuple)) else 1
+        exps = [ix[0] if isinstance(ix, (list, tuple)) else ix for ix in self.order]
+        if nvar != 1 or set(exps) - {0, 1}:
+            print('plot_linearity 僅適用單變數線性擬合 (order 僅含 0,1 次項)')
+            return
+        x = np.array(x); y = np.array(y)
+        yfit = self.forward(x)
+        err = np.abs(y - yfit)
+        mean_err = err.mean(); max_err = err.max()
+        eq = self.print_equation()
+        plt.figure(figsize=(5, 4), dpi=120)
+        plt.scatter(x, y, s=15, alpha=0.5, color='royalblue', label='Raw Data')
+        plt.plot(x, yfit, color='crimson', lw=1.5, label='Linear Fit')
+        plt.title('{}\nmean err = {:.4f},  max err = {:.4f}'.format(eq, mean_err, max_err), fontsize=9)
+        plt.xlabel(xlabel); plt.ylabel(ylabel)
+        plt.legend(fontsize=8)
+        plt.tight_layout()
+        if save_name is not None: plt.savefig(save_name)
+        plt.show()
+
+
+# ==================== 二維張量積 Chebyshev 基底 ====================
+def _chebyshev_T(x, max_order):
+    """第一類 Chebyshev 多項式 T_0..T_max_order，x 為 (N,)，回傳 (N, max_order+1)"""
+    N = len(x)
+    T = np.empty((N, max_order + 1), dtype=np.float64)
+    T[:, 0] = 1.0
+    if max_order >= 1:
+        T[:, 1] = x
+    for i in range(2, max_order + 1):
+        T[:, i] = 2.0 * x * T[:, i - 1] - T[:, i - 2]
+    return T
+
+def _chebyshev_dT(x, max_order):
+    """T'_0..T'_max_order，同樣 (N, max_order+1)"""
+    N = len(x)
+    dT = np.zeros((N, max_order + 1), dtype=np.float64)
+    if max_order >= 1:
+        dT[:, 1] = 1.0
+    for i in range(2, max_order + 1):
+        dT[:, i] = 2.0 * T_cache_holder[-1][:, i - 1] + 2.0 * x * dT[:, i - 1] - dT[:, i - 2]
+    return dT
+
+
+class Chebyshev_Fitting_2D():
+    """
+    二維張量積 Chebyshev 擬合：
+        f(x, y) ≈ Σ c_ij · T_i(xn) · T_j(yn)
+    其中 xn, yn 是將 x, y 映射到 [-1, 1] 的標準化座標。
+    order 格式與 Poly_Fitting 相同：[i, j] 表示 T_i(xn)·T_j(yn)。
+    """
+    def __init__(self, print_detial=False):
+        self.w = None
+        self.print_detial = print_detial
+        self.scaler = {}
+        self.info = {}
+        self.normalize = True
+    def _scale_fit(self, data):
+        dmin = data.min(axis=0)
+        dmax = data.max(axis=0)
+        scale = dmax - dmin
+        scale = np.where(np.abs(scale) < 1e-4, 1e-4, scale)
+        self.scaler = {'min': dmin, 'max': dmax, 'scale': scale}
+        return 2.0 * (data - dmin) / scale - 1.0
+    def _scale_apply(self, data):
+        p = self.scaler
+        return 2.0 * (data - p['min']) / p['scale'] - 1.0
+    def convert2basis(self, x_norm, order=None):
+        """x_norm: (N, 2) 已標準化到 [-1, 1] 的座標"""
+        if order is None:
+            order = self.order
+        max_i = max(o[0] for o in order)
+        max_j = max(o[1] for o in order)
+        Tx = _chebyshev_T(x_norm[:, 0], max_i)
+        Ty = _chebyshev_T(x_norm[:, 1], max_j)
+        A = np.empty((x_norm.shape[0], len(order)), dtype=np.float64)
+        for k, (i, j) in enumerate(order):
+            A[:, k] = Tx[:, i] * Ty[:, j]
+        return A
+    def least_square(self, x, y, order=None, normalize=True, epoch=1, dropout=0.05):
+        x = np.array(x, dtype=np.float64)
+        y = np.array(y, dtype=np.float64)
+        self.normalize = normalize
+        self.order = order
+        x_norm = self._scale_fit(x)                 # 標準化 x 到 [-1, 1]
+        y_scaled = y / 255.0 if False else y         # 保留原亮度尺度，方便比較
+        A = self.convert2basis(x_norm, order)
+        self.info['num_variables'] = A.shape[1]
+        self.info['num_samples'] = A.shape[0]
+        if self.print_detial:
+            print('Chebyshev Least Square samples:{}, variables:{}, ratio:{}'.format(
+                self.info['num_samples'], self.info['num_variables'],
+                round(self.info['num_samples']/self.info['num_variables'], 2)))
+        self.w = np.linalg.lstsq(A, y_scaled, rcond=None)[0]
+    def forward(self, x):
+        """x: (N, 2) 原始座標"""
+        x = np.array(x, dtype=np.float64)
+        x_norm = self._scale_apply(x)
+        A = self.convert2basis(x_norm, self.order)
+        y = A @ self.w
+        return y
+    def gradient(self, x_orig, y_orig):
+        """
+        解析梯度，使用 Chebyshev 導數遞迴公式。
+        回傳 (df/dx, df/dy)，形狀與輸入相同。
+        """
+        x_flat = x_orig.ravel().astype(np.float64)
+        y_flat = y_orig.ravel().astype(np.float64)
+        X_in = np.column_stack([x_flat, y_flat])
+        X_norm = self._scale_apply(X_in)
+
+        max_i = max(o[0] for o in self.order)
+        max_j = max(o[1] for o in self.order)
+
+        # T_i(xn), T_j(yn)
+        Tx = _chebyshev_T(X_norm[:, 0], max_i)
+        Ty = _chebyshev_T(X_norm[:, 1], max_j)
+
+        # T'_i(xn) 遞迴：T'_i = 2*T_{i-1} + 2*xn*T'_{i-1} - T'_{i-2}
+        dTx = np.zeros_like(Tx)
+        if max_i >= 1:
+            dTx[:, 1] = 1.0
+        for i in range(2, max_i + 1):
+            dTx[:, i] = 2.0 * Tx[:, i - 1] + 2.0 * X_norm[:, 0] * dTx[:, i - 1] - dTx[:, i - 2]
+
+        dTy = np.zeros_like(Ty)
+        if max_j >= 1:
+            dTy[:, 1] = 1.0
+        for j in range(2, max_j + 1):
+            dTy[:, j] = 2.0 * Ty[:, j - 1] + 2.0 * X_norm[:, 1] * dTy[:, j - 1] - dTy[:, j - 2]
+
+        # 累加 Σ c_ij * dT_i * T_j 和 Σ c_ij * T_i * dT_j
+        dfdxn = np.zeros_like(x_flat)
+        dfdyn = np.zeros_like(y_flat)
+        for coef, (i, j) in zip(self.w, self.order):
+            if i > 0:
+                dfdxn += coef * dTx[:, i] * Ty[:, j]
+            if j > 0:
+                dfdyn += coef * Tx[:, i] * dTy[:, j]
+
+        # 鏈式法則：xn = 2(x - min)/scale - 1 ⇒ dxn/dx = 2/scale
+        sx = self.scaler['scale'][0]
+        sy = self.scaler['scale'][1]
+        gx = (dfdxn * (2.0 / sx)).reshape(x_orig.shape)
+        gy = (dfdyn * (2.0 / sy)).reshape(y_orig.shape)
+        return gx, gy
+    def save(self, path='./cheb_weights.pkl'):
+        data = {'w':self.w, 'order':self.order, 'scaler':self.scaler}
+        save_pkl(path, data)
+        return self
+    def load(self, path='./cheb_weights.pkl'):
+        data = load_pkl(path)
+        self.w = data['w']; self.order = data['order']; self.scaler = data['scaler']
+        return self
+
+
+# ==================== 解析梯度（給 Poly_Fitting 用） ====================
+def poly_gradients_from_pf(pf, x_orig, y_orig):
+    x_flat = x_orig.ravel().astype(np.float64)
+    y_flat = y_orig.ravel().astype(np.float64)
+    N = x_flat.shape[0]
+    X_in = np.column_stack([x_flat, y_flat])
+    px = pf.scaler['x']
+    sx = (px['max'] - px['min'] + px['eps'])
+    x_norm = (X_in - px['min']) / sx
+    py = pf.scaler['y']
+    sy = py['max'] - py['min'] + py['eps']
+
+    dydx_norm = np.zeros((N, 2), dtype=np.float64)
+    for coef, (i, j) in zip(pf.w, pf.order):
+        if i > 0:
+            dydx_norm[:, 0] += coef * i * (x_norm[:, 0] ** (i-1)) * (x_norm[:, 1] ** j)
+        if j > 0:
+            dydx_norm[:, 1] += coef * j * (x_norm[:, 0] ** i) * (x_norm[:, 1] ** (j-1))
+    dydx_norm[:, 0] *= sy / sx[0]
+    dydx_norm[:, 1] *= sy / sx[1]
+    gx = dydx_norm[:, 0].reshape(x_orig.shape)
+    gy = dydx_norm[:, 1].reshape(y_orig.shape)
+    return gx, gy
+
+
+# ==================== 共用的直線抽取與比較 ====================
+def fit_line_ols(xs, ys):
+    m, b0 = np.polyfit(xs, ys, 1)
+    A_, B_, C_ = m, -1.0, b0
+    n = np.hypot(A_, B_)
+    return A_/n, B_/n, C_/n
+
+def line_to_phi_k(A, B, C, W, H):
+    cx, cy = W / 2.0, H / 2.0
+    phi = np.rad2deg(np.arctan2(B, A))
+    d = -(A * cx + B * cy + C)
+    k = d / min(W, H)
+    return phi, k
+
+def canonical(phi, k):
+    phi = phi % 360
+    if phi >= 180:
+        phi -= 180
+        k = -k
+    return phi, k
+
+def extract_edges(mag, percentile=99.5):
+    thr = np.percentile(mag, percentile)
+    mask = mag > thr
+    ys_edge, xs_edge = np.nonzero(mask)
+    return xs_edge, ys_edge
+
+def report(tag, xs_edge, ys_edge, W, H, phi_the, k_the):
+    A_fit, B_fit, C_fit = fit_line_ols(xs_edge.astype(float), ys_edge.astype(float))
+    phi_fit, k_fit = line_to_phi_k(A_fit, B_fit, C_fit, W, H)
+    phi_fit, k_fit = canonical(phi_fit, k_fit)
+    print(f"[{tag}] 邊界點數={len(xs_edge)},  phi={phi_fit:.4f}°,  k={k_fit:.6f},  "
+          f"Δphi={phi_fit - phi_the:+.4f}°,  Δk={k_fit - k_the:+.6f}")
+    return phi_fit, k_fit
+
+
+# ==================== 主流程 ====================
+if __name__ == '__main__':
+    from PIL import Image
+
+    W, H = 800, 600
+    PHI_DEG = 120.0
+    K = 0.15
+    DEGREE = 7
+
+    # ---------- 合成理論圖 ----------
+    phi_true = np.deg2rad(PHI_DEG)
+    d_true = K * min(W, H)
+    cx, cy = W / 2.0, H / 2.0
+    Yp, Xp = np.mgrid[0:H, 0:W]
+    F_true = np.cos(phi_true) * (Xp - cx) + np.sin(phi_true) * (Yp - cy) - d_true
+    I_true = np.where(F_true >= 0, 255, 0).astype(np.uint8)
+    Image.fromarray(I_true).save("ground_truth.png")
+
+    # ---------- 建 order ----------
+    order = []
+    for total in range(DEGREE + 1):
+        for i in range(total + 1):
+            j = total - i
+            order.append([i, j])
+    print(f"DEGREE = {DEGREE}, 項數 = {len(order)}")
+
+    x_flat = Xp.ravel().astype(np.float64)
+    y_flat = Yp.ravel().astype(np.float64)
+    X_in = np.column_stack([x_flat, y_flat])
+    b = I_true.ravel().astype(np.float64)
+
+    phi_the, k_the = canonical(PHI_DEG, K)
+
+    # ========== 方法 A：Poly_Fitting ==========
+    print("\n===== 方法 A：Poly_Fitting（單項式基底） =====")
+    pf = Poly_Fitting(print_detial=True)
+    pf.least_square(X_in, b, order=order, normalize=True, epoch=1, dropout=0.0)
+    recon_p = pf.forward(X_in).reshape(H, W)
+    Image.fromarray(np.clip(recon_p, 0, 255).astype(np.uint8)).save("recon_poly.png")
+    rmse_p = np.sqrt(np.mean((recon_p - I_true.astype(np.float64)) ** 2))
+    print(f"Poly 重建 RMSE = {rmse_p:.3f}")
+
+    gx_p, gy_p = poly_gradients_from_pf(pf, Xp, Yp)
+    mag_p = np.hypot(gx_p, gy_p)
+    xs_p, ys_p = extract_edges(mag_p, 99.5)
+    report("Poly", xs_p, ys_p, W, H, phi_the, k_the)
+
+    # ========== 方法 B：Chebyshev_Fitting_2D ==========
+    print("\n===== 方法 B：Chebyshev_Fitting_2D（張量積 Chebyshev 基底） =====")
+    cf = Chebyshev_Fitting_2D(print_detial=True)
+    cf.least_square(X_in, b, order=order, normalize=True)
+    recon_c = cf.forward(X_in).reshape(H, W)
+    Image.fromarray(np.clip(recon_c, 0, 255).astype(np.uint8)).save("recon_cheb.png")
+    rmse_c = np.sqrt(np.mean((recon_c - I_true.astype(np.float64)) ** 2))
+    print(f"Chebyshev 重建 RMSE = {rmse_c:.3f}")
+
+    gx_c, gy_c = cf.gradient(Xp, Yp)
+    mag_c = np.hypot(gx_c, gy_c)
+    xs_c, ys_c = extract_edges(mag_c, 99.5)
+    report("Cheb", xs_c, ys_c, W, H, phi_the, k_the)
+
+    print("\n========== 最終比較 ==========")
+    print(f"理論值        : phi = {phi_the:.4f}°, k = {k_the:.6f}")
