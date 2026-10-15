@@ -1,0 +1,298 @@
+import numpy as np
+import pickle
+import itertools
+import warnings
+
+
+class Poly_Fitting:
+    def __init__(self, basis="泰勒"):
+        self.basis = basis
+        self.w = None
+        self.order = None
+        self.n_dims = None
+        self.x_min = None
+        self.x_max = None
+        self.x_range = None
+        self.x_mean = None
+        self.x_std = None
+        self.y_min = None
+        self.y_max = None
+        self.y_mean = None
+        self.y_std = None
+        self.rescale = False
+        self.exponents = None
+        self.active_idx = None
+
+    def _generate_exponents(self, order, n_dims):
+        if isinstance(order, list) and len(order) > 0 and isinstance(order[0], (list, tuple)):
+            exps = [tuple(e) for e in order]
+            for e in exps:
+                if len(e) != n_dims:
+                    raise ValueError(f"Exponent tuples must have length {n_dims}, got {e}")
+                if any(val < 0 for val in e):
+                    raise ValueError(f"exponent 不能為負, got {e}")
+            return exps
+        elif isinstance(order, (list, tuple)) and all(isinstance(o, (int, np.integer)) for o in order):
+            if n_dims == 1:
+                if any(o < 0 for o in order):
+                    raise ValueError(f"order 不能為負, got {order}")
+                return [(int(e),) for e in order]
+            else:
+                if len(order) != n_dims:
+                    raise ValueError(f"order length {len(order)} != n_dims {n_dims}")
+                if any(o <= 0 for o in order):
+                    raise ValueError(f"list order 每個維度項數必須 > 0, got {order}")
+                ranges = [range(int(o)) for o in order]
+                exps = list(itertools.product(*ranges))
+                return exps
+        else:
+            raise ValueError("Unsupported order format")
+
+    def _cheb_poly(self, x, n):
+        if n == 0:
+            return np.ones_like(x)
+        elif n == 1:
+            return x
+        else:
+            T0 = np.ones_like(x)
+            T1 = x
+            for k in range(2, n + 1):
+                T2 = 2 * x * T1 - T0
+                T0, T1 = T1, T2
+            return T1
+
+    def _basis_function(self, x, exps):
+        N = x.shape[0]
+        M = len(exps)
+        A = np.ones((N, M))
+        for j, exp in enumerate(exps):
+            for d, e in enumerate(exp):
+                if self.basis == "泰勒":
+                    A[:, j] *= x[:, d] ** e
+                elif self.basis == "切比雪夫":
+                    A[:, j] *= self._cheb_poly(x[:, d], e)
+                else:
+                    raise ValueError(f"Unknown basis: {self.basis}")
+        return A
+
+    def _preprocess_x(self, x, fit=False):
+        x = np.asarray(x, dtype=float)
+        if x.ndim == 1:
+            x = x.reshape(-1, 1)
+        if fit:
+            self.x_min = x.min(axis=0)
+            self.x_max = x.max(axis=0)
+            self.x_range = self.x_max - self.x_min
+            self.x_range[self.x_range == 0] = 1.0
+        if self.basis == "切比雪夫":
+            if self.x_min is None or self.x_max is None:
+                raise ValueError("Model not fitted yet.")
+            x_scaled = 2 * (x - self.x_min) / self.x_range - 1
+        else:
+            if self.rescale:
+                if fit:
+                    self.x_mean = x.mean(axis=0)
+                    self.x_std = x.std(axis=0)
+                    self.x_std[self.x_std == 0] = 1.0
+                if self.x_mean is None or self.x_std is None:
+                    raise ValueError("Model not fitted yet.")
+                x_scaled = (x - self.x_mean) / self.x_std
+            else:
+                x_scaled = x
+        return x_scaled
+
+    def _preprocess_y(self, y, fit=False):
+        y = np.asarray(y, dtype=float).ravel()
+        if fit and self.rescale:
+            self.y_mean = y.mean()
+            self.y_std = y.std()
+            if self.y_std == 0:
+                self.y_std = 1.0
+        if self.rescale:
+            if self.y_mean is None or self.y_std is None:
+                raise ValueError("Model not fitted yet.")
+            y_scaled = (y - self.y_mean) / self.y_std
+        else:
+            y_scaled = y
+        return y_scaled
+
+    def _inverse_y(self, y_scaled):
+        if self.rescale:
+            return y_scaled * self.y_std + self.y_mean
+        else:
+            return y_scaled
+
+    def learn(self, x, y, order=[0, 1], times=1, p=0.05, rescale=False):
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float).ravel()
+
+        if not np.isfinite(x).all():
+            raise ValueError("x 包含 NaN 或 Inf")
+        if not np.isfinite(y).all():
+            raise ValueError("y 包含 NaN 或 Inf")
+        if x.shape[0] != y.shape[0]:
+            raise ValueError("x 和 y 長度不一致")
+        if times < 1:
+            raise ValueError(f"times 必須 >= 1，得到 {times}")
+        if not (0.0 <= p < 1.0):
+            raise ValueError(f"p 必須介於 [0, 1) 之間，得到 {p}")
+
+        if x.ndim == 1:
+            x = x.reshape(-1, 1)
+
+        n_samples, n_dims = x.shape
+        self.n_dims = n_dims
+        self.rescale = rescale
+
+        self.exponents = self._generate_exponents(order, n_dims)
+        self.order = order
+
+        x_scaled = self._preprocess_x(x, fit=True)
+        y_scaled = self._preprocess_y(y, fit=True)
+
+        A = self._basis_function(x_scaled, self.exponents)
+        n_features = A.shape[1]
+
+        # 第一輪初始保留所有樣本索引
+        active_idx = np.arange(n_samples)
+
+        for t in range(times):
+            A_sub = A[active_idx]
+            y_sub = y_scaled[active_idx]
+
+            # 當前保留樣本進行最小平方法擬合
+            self.w, _, _, _ = np.linalg.lstsq(A_sub, y_sub, rcond=None)
+
+            # 若尚未達到最後一輪，計算誤差並剔除離群值
+            if t < times - 1:
+                yfit_sub_scaled = A_sub @ self.w
+                residuals = np.abs(yfit_sub_scaled - y_sub)
+
+                n_curr = len(active_idx)
+                n_drop = int(n_curr * p)
+
+                if n_drop > 0:
+                    # 確保保留樣本數不少於特徵項數
+                    n_keep = max(n_features, n_curr - n_drop)
+                    sort_order = np.argsort(residuals)
+                    keep_idx = sort_order[:n_keep]
+                    active_idx = active_idx[keep_idx]
+
+        self.active_idx = active_idx
+
+        yfit_scaled = A @ self.w
+        yfit = self._inverse_y(yfit_scaled)
+        y_range = y.max() - y.min()
+        if y_range == 0:
+            linearity = 0.0
+        else:
+            linearity = np.mean(np.abs(yfit - y)) / y_range * 100
+        print(f"linearity = {linearity:.4e} %")
+        return self
+
+    def forward(self, x):
+        if self.w is None:
+            raise ValueError("Model not fitted yet.")
+        x = np.asarray(x, dtype=float)
+        if x.ndim == 1:
+            x = x.reshape(-1, 1)
+        x_scaled = self._preprocess_x(x, fit=False)
+        A = self._basis_function(x_scaled, self.exponents)
+        y_scaled = A @ self.w
+        return self._inverse_y(y_scaled)
+
+    def save(self, fpath="./lsq_weight.pkl"):
+        state = {
+            'basis': self.basis,
+            'w': self.w,
+            'order': self.order,
+            'n_dims': self.n_dims,
+            'x_min': self.x_min,
+            'x_max': self.x_max,
+            'x_range': self.x_range,
+            'x_mean': self.x_mean,
+            'x_std': self.x_std,
+            'y_min': self.y_min,
+            'y_max': self.y_max,
+            'y_mean': self.y_mean,
+            'y_std': self.y_std,
+            'rescale': self.rescale,
+            'exponents': self.exponents,
+            'active_idx': self.active_idx,
+        }
+        with open(fpath, 'wb') as f:
+            pickle.dump(state, f)
+
+    def load(self, fpath="./lsq_weight.pkl"):
+        with open(fpath, 'rb') as f:
+            state = pickle.load(f)
+        self.basis = state['basis']
+        self.w = state['w']
+        self.order = state['order']
+        self.n_dims = state['n_dims']
+        self.x_min = state['x_min']
+        self.x_max = state['x_max']
+        self.x_range = state['x_range']
+        self.x_mean = state['x_mean']
+        self.x_std = state['x_std']
+        self.y_min = state['y_min']
+        self.y_max = state['y_max']
+        self.y_mean = state['y_mean']
+        self.y_std = state['y_std']
+        self.rescale = state['rescale']
+        self.exponents = state['exponents']
+        self.active_idx = state.get('active_idx', None)
+        return self
+
+
+if __name__ == "__main__":
+    np.random.seed(42)
+
+    def sep(t):
+        print("\n" + "=" * 72)
+        print(t)
+        print("=" * 72)
+
+    def note(lines):
+        """縮排小提示，讓輸出更容易閱讀。"""
+        for ln in lines:
+            print("    " + ln)
+
+    def blank():
+        print()
+
+    # ============================================================
+    # Demo 1：1D 泰勒基底
+    # ============================================================
+    sep("Demo 1: 1D Taylor basis - y = 1 + 2x + 3x^2")
+    note([
+        "Purpose : verify the most basic usage; weight matches polynomial coeffs.",
+        "Data    : x in [-1, 1], 100 points.",
+        "Basis   : Taylor x^0, x^1, x^2 (order=[0,1,2]).",
+        "Expect  : weight ~ [1, 2, 3], max_err ~ 0.",
+    ])
+    blank()
+
+    x = np.linspace(-1, 1, 100)
+    y = 1 + 2 * x + 3 * x ** 2
+
+    pfit = Poly_Fitting(basis="泰勒")
+    pfit.learn(x, y, order=[0, 1, 2])
+    yfit = pfit.forward(x)
+
+    print("  weight         = " + str(pfit.w))
+    print("  max |yfit - y| = %.3e" % np.max(np.abs(yfit - y)))
+    note([
+        "Read    : weight[0]=%.4f (want 1)" % pfit.w[0],
+        "          weight[1]=%.4f (want 2)" % pfit.w[1],
+        "          weight[2]=%.4f (want 3)" % pfit.w[2],
+        "          -> 1D and non-collinear basis: weight == analytic coeffs.",
+    ])
+
+    # ============================================================
+    # Demo 2：1D 切比雪夫基底 + 高頻訊號
+    # ============================================================
+    sep("Demo 2: 1D Chebyshev basis - high-freq sin(50t) + 0.5 cos(30t)")
+    note([
+        "Purpose : compare Taylor vs Chebyshev stability at high order.",
+        "Data    : t in [0, 1], 100
