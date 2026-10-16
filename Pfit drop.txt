@@ -1,0 +1,159 @@
+import numpy as np
+import matplotlib
+matplotlib.rcParams["font.family"] = "sans-serif"
+matplotlib.rcParams["font.sans-serif"] = ["Microsoft JhengHei", "PingFang TC", "Noto Sans CJK TC", "DejaVu Sans"]
+matplotlib.rcParams["axes.unicode_minus"] = False
+import matplotlib.pyplot as plt
+
+from toolbox.poly_fitting_helper import Poly_Fitting
+
+
+def poly_predict(x, w, order):
+    """用 w 與 order 手動計算多項式預測值。"""
+    y = np.zeros_like(x)
+    for k, o in enumerate(order):
+        y = y + w[k] * (x ** o[0])
+    return y
+
+
+def fit_poly(x, y, order):
+    """呼叫 Poly_Fitting 做一次最小平方擬合，回傳係數 w。"""
+    X = x.reshape(-1, 1)
+    pfit = Poly_Fitting(basis="泰勒")
+    pfit.learn(X, y, order=order)
+    w = np.asarray(pfit.w, dtype=float).ravel()
+    return w
+
+
+def iterative_fit_with_drop(x, y, order, n_drop):
+    """
+    迭代擬合 + 剔除：
+      每一步先做一次 LSQ，接著把「殘差最大」的 inlier 剔除。
+      重複 n_drop 次，最後回傳每一步的歷史。
+    回傳：list of dict，每個 dict 是該步的 (mask, w, y_pred, resid)。
+    """
+    N = x.size
+    mask = np.ones(N, dtype=bool)
+    history = []
+    for it in range(n_drop + 1):
+        w = fit_poly(x[mask], y[mask], order)
+        y_pred = poly_predict(x, w, order)
+        resid = np.abs(y - y_pred)
+        history.append({
+            "it": it,
+            "mask": mask.copy(),
+            "w": w,
+            "y_pred": y_pred,
+            "resid": resid,
+            "n_in": int(mask.sum()),
+        })
+        if it < n_drop:
+            idx_in = np.where(mask)[0]
+            worst = idx_in[np.argmax(resid[idx_in])]
+            mask[worst] = False
+    return history
+
+
+def rmse(y, y_hat, mask=None):
+    """計算 RMSE；mask=None 時用全部點。"""
+    if mask is None:
+        mask = np.ones_like(y, dtype=bool)
+    return float(np.sqrt(np.mean((y[mask] - y_hat[mask]) ** 2)))
+
+
+if __name__ == "__main__":
+    rng = np.random.default_rng(42)
+
+    # ---- 精確曲線：sigmoid（S 型） ----
+    x_true = np.linspace(-5.0, 5.0, 500)
+    y_true = 1.0 / (1.0 + np.exp(-x_true))
+
+    # ---- 取樣點（加雜訊） ----
+    N = 40
+    x = np.linspace(-5.0, 5.0, N)
+    y_clean = 1.0 / (1.0 + np.exp(-x))
+    y = y_clean + 0.02 * rng.standard_normal(N)
+
+    # ---- 加入 3 個離群點 ----
+    outlier_idx = np.array([5, 18, 32])
+    outlier_off = np.array([+0.55, -0.60, +0.70])
+    y[outlier_idx] += outlier_off
+
+    # ---- 多項式階數（泰勒基底）：order = [[0], [1], ..., [K]] ----
+    K = 7
+    order = [[k] for k in range(K + 1)]
+
+    # ---- 六個情況：剔除 0、1、2、3、4、5 個點 ----
+    drop_counts = [0, 1, 2, 3, 4, 5]
+    colors = plt.cm.viridis(np.linspace(0.05, 0.9, len(drop_counts)))
+
+    fig, axes = plt.subplots(2, 3, figsize=(16, 9), sharex=True, sharey=True)
+    axes = axes.ravel()
+
+    x_grid = np.linspace(x.min(), x.max(), 500)
+
+    for i, drop in enumerate(drop_counts):
+        ax = axes[i]
+        hist = iterative_fit_with_drop(x, y, order, n_drop=drop)
+        last = hist[-1]
+        mask = last["mask"]
+        w = last["w"]
+
+        # 真實曲線
+        ax.plot(x_true, y_true, "-", color="black", lw=1.5,
+                alpha=0.7, label="真實曲線")
+
+        # 全部樣本（淺灰）
+        ax.scatter(x, y, s=30, c="lightgray", edgecolor="k",
+                   linewidth=0.5, zorder=3, label="全部樣本")
+
+        # inlier（藍）
+        ax.scatter(x[mask], y[mask], s=30, c="steelblue",
+                   edgecolor="k", linewidth=0.5, zorder=4, label="保留樣本")
+
+        # 被剔除的點（紅圈）
+        if (~mask).any():
+            ax.scatter(x[~mask], y[~mask], s=70, facecolors="none",
+                       edgecolors="crimson", linewidth=1.8,
+                       zorder=5, label="剔除樣本")
+
+        # 擬合曲線（細網格）
+        y_grid = poly_predict(x_grid, w, order)
+        ax.plot(x_grid, y_grid, "-", color=colors[i], lw=2.0,
+                zorder=6, label=f"擬合 (剔除 {drop})")
+
+        # 標題附上 inlier 數與 RMSE（只算 inlier）
+        r_in = rmse(y, last["y_pred"], mask=mask)
+        ax.set_title(f"剔除 {drop} 個   "
+                     f"inlier = {last['n_in']}/{N}   "
+                     f"inlier RMSE = {r_in:.4f}")
+        ax.grid(True, ls="--", alpha=0.4)
+        ax.set_ylim(-0.4, 1.4)
+
+        if i == 0:
+            ax.legend(fontsize=7, loc="upper left")
+
+    fig.suptitle("最小平方法工具包示範 — S 型曲線 + 3 個離群點，逐步剔除最大殘差",
+                 fontsize=13)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.show()
+
+    # ---- 終端摘要 ----
+    print("\n" + "=" * 72)
+    print("  逐步剔除結果")
+    print("=" * 72)
+    print(f"  {'drop':>5}  {'inliers':>8}  {'inlier RMSE':>12}  "
+          f"{'all RMSE':>10}  {'剔除的樣本索引':>20}")
+    print("  " + "-" * 68)
+
+    idx_sorted = np.arange(N)
+    for drop in drop_counts:
+        hist = iterative_fit_with_drop(x, y, order, n_drop=drop)
+        last = hist[-1]
+        mask = last["mask"]
+        removed = idx_sorted[~mask].tolist()
+        r_in = rmse(y, last["y_pred"], mask=mask)
+        r_all = rmse(y, last["y_pred"], mask=None)
+        print(f"  {drop:>5}  {last['n_in']:>8}  {r_in:>12.6f}  "
+              f"{r_all:>10.6f}  {str(removed):>20}")
+    print("=" * 72)
